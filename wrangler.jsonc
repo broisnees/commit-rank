@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "commit-rank",
+  "account_id": "16b2c363a412bfaaec2a5a2572964728",
+  "observability": { "enabled": true },
+  "workers_dev": true,
+  "preview_urls": false,
+  // KV namespace "commit-rank-cache": profile + search + custom-city caches
+  "kv_namespaces": [{ "binding": "CACHE", "id": "95a137069c754a9e964a11ea6738097d" }],
+  // D1 "commit-rank": every tracked developer + precomputed leaderboards
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "commit-rank",
+      "database_id": "4a16d556-3a94-4aaa-aaf2-9f3f89edb7d5",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Must match nitro.scheduledTasks in nuxt.config.ts
+  "triggers": { "crons": ["*/2 * * * *"] }
+}
