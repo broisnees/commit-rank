@@ -1,7 +1,7 @@
 /**
  * Cron (every 2 minutes): discover one location's developers if due, fetch stats for a
- * slice of missing/stale ones, rebuild that location's board. Sized for the Workers free
- * plan; raise NUXT_CRAWL_BATCH on a paid plan to crawl faster.
+ * slice of missing/stale ones, rebuild that location's board (at most every 30 minutes).
+ * Sized for the Workers free plan; raise NUXT_CRAWL_BATCH on a paid plan to crawl faster.
  */
 export default defineTask({
   meta: {

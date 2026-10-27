@@ -22,11 +22,13 @@ export default defineTask({
 
     while (Date.now() < deadline) {
       const started = Date.now()
-      // locally the aggregate scans are free, so keep global + countries close to live
+      // locally the board scans are free, so rebuild every step and keep global + countries
+      // close to live
       last = await crawlStep({
         users,
         depth: Number(config.discoverDepth) || 1000,
         aggregatesEvery: 3 * 60_000,
+        boardsEvery: 0,
       })
       steps++
       fetched += last.fetched

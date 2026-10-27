@@ -1,5 +1,5 @@
 import type { H3Event } from 'h3'
-import type { D1Database, D1Statement } from './db'
+import type { D1Database } from './db'
 import type { UserStub } from './stats'
 
 /** Rows shown per metric on a leaderboard. */
@@ -13,9 +13,12 @@ const HOUR = 60 * 60 * 1000
 const ACTIVE_MAX_AGE = 20 * HOUR
 const QUIET_MAX_AGE = 72 * HOUR
 const REDISCOVER_AFTER = 72 * HOUR
+// A location's board scans its rows several times over, so the crawler rebuilds it at most
+// this often; a qualifying profile claim still rebuilds it at once.
+const BOARD_REBUILD_AFTER = HOUR / 2
 // The global board and country aggregates scan every row, so they run on a slower clock.
-const GLOBAL_REBUILD_AFTER = 3 * HOUR
-const COUNTRIES_REBUILD_AFTER = 3 * HOUR
+const GLOBAL_REBUILD_AFTER = 6 * HOUR
+const COUNTRIES_REBUILD_AFTER = 6 * HOUR
 const CUSTOM_MAX_AGE = 6 * 60 * 60
 /** GraphQL points kept in reserve for visitors; the crawler pauses below this. */
 const MIN_RATE_LIMIT = 400
@@ -32,7 +35,11 @@ const slugFor = (location: string | null, fallback: string) =>
 // Writes: one statement per call via json_each (D1 free plan allows 50 queries per invocation)
 // ---------------------------------------------------------------------------
 
-/** Insert newly discovered users; refresh profile fields of known ones without touching stats. */
+/**
+ * Insert newly discovered users; refresh profile fields of known ones still waiting for stats.
+ * Fetched rows are left alone: their next stats refresh rewrites these fields anyway, and
+ * rediscovery re-sees ~1,000 users per location, most with a changed follower count.
+ */
 export async function saveStubs(db: D1Database, stubs: UserStub[], fallbackSlug: string) {
   if (!stubs.length) return
   const rows = stubs.map(u => ({ ...u, loc: slugFor(u.location, fallbackSlug) }))
@@ -45,8 +52,9 @@ export async function saveStubs(db: D1Database, stubs: UserStub[], fallbackSlug:
        ON CONFLICT (login) DO UPDATE SET
          id = excluded.id, name = excluded.name, location = excluded.location,
          company = excluded.company, loc = excluded.loc, followers = excluded.followers
-       WHERE users.followers != excluded.followers OR users.loc != excluded.loc
-          OR users.location IS NOT excluded.location OR users.name IS NOT excluded.name`,
+       WHERE users.fetched_at IS NULL AND (
+         users.followers != excluded.followers OR users.loc != excluded.loc
+         OR users.location IS NOT excluded.location OR users.name IS NOT excluded.name)`,
     )
     .bind(JSON.stringify(rows))
     .run()
@@ -97,49 +105,100 @@ async function markAttempted(db: D1Database, logins: string[]) {
 // Boards: precomputed per location, one row read per page view
 // ---------------------------------------------------------------------------
 
-type BoardRow = RankedUser & { n: number }
+type BoardRow = RankedUser & { automated: number }
 
 const boardMemory = new Map<string, { at: number; board: Leaderboard }>()
 const BOARD_MEMORY_TTL = 60_000
 
-/** Rebuild a location's board (or the global one) from tracked users. */
+/** Highest first by one metric, ties to the more-followed developer. */
+const rankBy = <T extends RankedUser>(users: T[], key: MetricKey) =>
+  [...users].sort((a, b) => b[key] - a[key] || b.followers - a.followers)
+
+const withoutFlag = ({ automated: _, ...user }: BoardRow): RankedUser => user
+
+/**
+ * Per-metric floors no one below can cross into the global top N, plus the ranked count.
+ * Floors sit 20% under the last global board's cutoffs; a metric whose floor no longer leaves
+ * N developers above it (or a first build) takes its exact Nth value instead.
+ */
+async function globalFloors(db: D1Database) {
+  const last = await db
+    .prepare(`SELECT data FROM boards WHERE loc = 'global'`)
+    .first<{ data: string }>()
+  const previous = last ? (JSON.parse(last.data) as Leaderboard) : null
+  const floors = Object.fromEntries(
+    METRIC_KEYS.map(key => [
+      key,
+      previous && previous.users.length >= BOARD_LIMIT
+        ? Math.floor(valueAt(previous, key) * 0.8)
+        : Number.MAX_SAFE_INTEGER,
+    ]),
+  ) as Record<MetricKey, number>
+  const counts = await db
+    .prepare(
+      `SELECT COUNT(*) AS n, ${METRIC_KEYS.map((key, i) => `SUM(${key} >= ?${i + 1}) AS ${key}`).join(', ')}
+       FROM users WHERE commits IS NOT NULL AND automated = 0`,
+    )
+    .bind(...METRIC_KEYS.map(key => floors[key]))
+    .first<Record<MetricKey | 'n', number | null>>()
+  const n = counts?.n ?? 0
+  const needed = Math.min(BOARD_LIMIT, n)
+  for (const key of METRIC_KEYS) {
+    if ((counts?.[key] ?? 0) >= needed) continue
+    const row = await db
+      .prepare(
+        `SELECT ${key} AS v FROM users WHERE commits IS NOT NULL AND automated = 0
+         ORDER BY ${key} DESC LIMIT 1 OFFSET ?1`,
+      )
+      .bind(needed - 1)
+      .first<{ v: number }>()
+    floors[key] = row?.v ?? 0
+  }
+  return { n, floors }
+}
+
+/**
+ * Rebuild a location's board (or the global one) from tracked users. Ranking runs here, not
+ * in SQL: five ROW_NUMBER() windows re-read every row ~18 times. A location's ~1,000 rows are
+ * read once; the global board reads only developers above its floors.
+ */
 export async function buildBoard(db: D1Database, slug: string): Promise<Leaderboard | null> {
   const loc = resolveLocation(slug)
   if (!loc) return null
-  const scope = slug === 'global' ? '' : 'AND loc = ?2'
-  const bindScope = (statement: D1Statement, ...first: unknown[]) =>
-    slug === 'global' ? statement.bind(...first) : statement.bind(...first, slug)
-  // One scan returns only the union of the top N for every metric, plus the tracked count.
-  const statement = db.prepare(
-    `SELECT ${STAT_COLUMNS}, n FROM (
-       SELECT *, COUNT(*) OVER () AS n,
-         ROW_NUMBER() OVER (ORDER BY commits DESC, followers DESC) AS r1,
-         ROW_NUMBER() OVER (ORDER BY prs DESC, followers DESC) AS r2,
-         ROW_NUMBER() OVER (ORDER BY reviews DESC, followers DESC) AS r3,
-         ROW_NUMBER() OVER (ORDER BY contributions DESC, followers DESC) AS r4,
-         ROW_NUMBER() OVER (ORDER BY followers DESC) AS r5
-       FROM users WHERE commits IS NOT NULL AND automated = 0 ${scope}
-     ) WHERE r1 <= ?1 OR r2 <= ?1 OR r3 <= ?1 OR r4 <= ?1 OR r5 <= ?1`,
-  )
-  const automatedStatement = db.prepare(
-    `SELECT ${STAT_COLUMNS} FROM users WHERE automated = 1 ${scope}
-     ORDER BY commits DESC LIMIT ?1`,
-  )
-  const [{ results }, { results: automated }, crawl] = await Promise.all([
-    bindScope(statement, BOARD_LIMIT).all<BoardRow>(),
-    bindScope(automatedStatement, AUTOMATED_SHOWN).all<RankedUser>(),
+  const global = slug === 'global'
+  const { n, floors } = global ? await globalFloors(db) : { n: undefined, floors: undefined }
+  const statement = floors
+    ? db
+        .prepare(
+          `SELECT ${STAT_COLUMNS}, automated FROM users WHERE commits IS NOT NULL AND (
+             automated = 1 OR ${METRIC_KEYS.map((key, i) => `${key} >= ?${i + 1}`).join(' OR ')})`,
+        )
+        .bind(...METRIC_KEYS.map(key => floors[key]))
+    : db
+        .prepare(`SELECT ${STAT_COLUMNS}, automated FROM users WHERE loc = ?1 AND commits IS NOT NULL`)
+        .bind(slug)
+  const [{ results: rows }, crawl] = await Promise.all([
+    statement.all<BoardRow>(),
     db.prepare('SELECT total FROM crawl WHERE loc = ?1').bind(slug).first<{ total: number | null }>(),
   ])
-  if (!results.length) return null
+  const ranked = rows.filter(u => !u.automated)
+  if (!ranked.length) return null
 
-  const indexedUsers = results[0]!.n
+  // the union of the top N for every metric
+  const top = new Map<string, RankedUser>()
+  for (const key of METRIC_KEYS) {
+    for (const user of rankBy(ranked, key).slice(0, BOARD_LIMIT)) top.set(user.login, withoutFlag(user))
+  }
+  const indexedUsers = n ?? ranked.length
   const board: Leaderboard = {
     location: loc,
-    users: results.map(({ n: _, ...user }) => user),
+    users: [...top.values()],
     limit: BOARD_LIMIT,
     indexedUsers,
     totalUsers: Math.max(crawl?.total ?? 0, indexedUsers),
-    automated,
+    automated: rankBy(rows.filter(u => u.automated), 'commits')
+      .slice(0, AUTOMATED_SHOWN)
+      .map(withoutFlag),
     generatedAt: Date.now(),
   }
   await db
@@ -330,21 +389,16 @@ interface CountryRow {
 let countriesMemory: { at: number; board: CountriesBoard } | undefined
 
 export async function buildCountries(db: D1Database): Promise<CountriesBoard> {
-  // One scan: per-country sums plus each country's top committer.
+  // One scan: per-country sums plus each country's top committer (with a single MAX(),
+  // SQLite takes the bare columns from the row holding it).
   const { results } = await db
     .prepare(
-      `SELECT * FROM (
-         SELECT loc, id, login, name, commits,
-           COUNT(*) OVER w AS developers,
-           SUM(commits) OVER w AS total_commits,
-           SUM(prs) OVER w AS total_prs,
-           SUM(reviews) OVER w AS total_reviews,
-           SUM(contributions) OVER w AS total_contributions,
-           ROW_NUMBER() OVER (PARTITION BY loc ORDER BY commits DESC, followers DESC) AS r
-         FROM users
-         WHERE commits IS NOT NULL AND automated = 0 AND loc != ?1
-         WINDOW w AS (PARTITION BY loc)
-       ) WHERE r = 1`,
+      `SELECT loc, COUNT(*) AS developers, SUM(commits) AS total_commits, SUM(prs) AS total_prs,
+              SUM(reviews) AS total_reviews, SUM(contributions) AS total_contributions,
+              MAX(commits) AS commits, id, login, name
+       FROM users
+       WHERE commits IS NOT NULL AND automated = 0 AND loc != ?1
+       GROUP BY loc`,
     )
     .bind(OTHER)
     .all<CountryRow>()
@@ -411,6 +465,8 @@ export async function crawlStep(opts: {
   event?: H3Event
   /** how stale the global/countries aggregates may get (they scan everyone) */
   aggregatesEvery?: number
+  /** minimum time between rebuilds of one location's board */
+  boardsEvery?: number
 }) {
   const db = useDB(opts.event)
   const now = Date.now()
@@ -459,15 +515,23 @@ export async function crawlStep(opts: {
     summary.discovered = loc.slug
   }
 
-  // 2. Refresh: spend the user budget on the locations waiting longest (a just-discovered
+  // 2. Refresh: spend the user budget on the location waiting longest (a just-discovered
   //    one goes first, featured ones get a head start), most-followed missing/stale users first.
+  //    One location per run: a visit reads the location's rows twice (pick users, rebuild the
+  //    board), so each visit should refresh as many developers as the budget allows.
   const priority = (c: CrawlRow) =>
     c.loc === summary.discovered
       ? -Infinity
       : (c.refreshed_at ?? 0) - (FEATURED.has(c.loc) ? 2 * HOUR : 0)
   const queue = refreshable.map(slug => byLoc.get(slug)!).sort((a, b) => priority(a) - priority(b))
+  const targets = queue.slice(0, 1)
+  const { results: built } = await db
+    .prepare('SELECT loc, built_at FROM boards WHERE loc IN (SELECT value FROM json_each(?1))')
+    .bind(JSON.stringify([...targets.map(t => t.loc), 'global', 'countries']))
+    .all<{ loc: string; built_at: number }>()
+  const builtAt = (loc: string) => built.find(b => b.loc === loc)?.built_at ?? 0
   let budget = opts.users
-  for (const target of queue.slice(0, 4)) {
+  for (const target of targets) {
     if (budget <= 0) break
     const { results } = await db
       .prepare(
@@ -498,14 +562,14 @@ export async function crawlStep(opts: {
     budget -= logins.length
     summary.refreshed.push(target.loc)
     summary.fetched += stats.length
-    if (target.loc !== OTHER && (await buildBoard(db, target.loc))) summary.boards.push(target.loc)
+    // A slice that skips the rebuild reaches the board at this location's next rebuild.
+    const boardDue = now - builtAt(target.loc) > (opts.boardsEvery ?? BOARD_REBUILD_AFTER)
+    if (target.loc !== OTHER && boardDue && (await buildBoard(db, target.loc))) {
+      summary.boards.push(target.loc)
+    }
   }
 
   // 3. Global and country aggregates scan everyone, so they rebuild on a slower clock.
-  const { results: built } = await db
-    .prepare(`SELECT loc, built_at FROM boards WHERE loc IN ('global', 'countries')`)
-    .all<{ loc: string; built_at: number }>()
-  const builtAt = (loc: string) => built.find(b => b.loc === loc)?.built_at ?? 0
   if (now - builtAt('global') > (opts.aggregatesEvery ?? GLOBAL_REBUILD_AFTER)) {
     if (await buildBoard(db, 'global')) summary.boards.push('global')
   }

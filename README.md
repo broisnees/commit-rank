@@ -23,7 +23,7 @@ GitHub can't sort users by commits, so commitrank keeps its own index in **D1**:
 
 1. **Discovery.** For each country (search terms include its major cities), the crawler pulls the **1,000 most-followed users** from GitHub search, which is the maximum GitHub returns.
 2. **Stats.** Each user's last-12-month commits, PRs, reviews, issues and contributions are fetched with batched GraphQL. They're refreshed about daily.
-3. **Boards.** After each crawl slice, the location's leaderboard is rebuilt with one SQL window query and stored as a single row. A page view is one D1 row read, or zero reads when it's cached in memory.
+3. **Boards.** After a crawl slice, the location's leaderboard is rebuilt with one SQL window query (at most every 30 minutes per location) and stored as a single row. A page view is one D1 row read, or zero reads when it's cached in memory.
 4. **Automation filter.** Auto-commit scripts can log 1,000+ commits a day. Accounts averaging 100+ commits (or 150+ contributions) per active day are flagged and kept off the rankings. Each board lists them under "Excluded as likely automation".
 5. **Claim by visiting.** Opening any profile registers that developer with fresh stats. If they make their country's top 100, the board is rebuilt on the spot. Their rank is exact among everyone tracked in the country, plus a worldwide rank when they're in the global top 100.
 
@@ -73,7 +73,7 @@ gh auth token | pnpm wrangler secret put NUXT_GITHUB_TOKEN     # rotate the GitH
 
 ### Syncing data
 
-- **Continuous.** Cron runs every 2 minutes. It discovers one location when due (every 72h) and fetches stats for 50 developers. Board contenders (1+ commit a day or 50+ PRs a year) are refreshed daily, never-fetched developers next, and the long tail every 3 days.
+- **Continuous.** Cron runs every 2 minutes. It discovers one location when due (every 72h) and fetches stats for up to 50 developers in one location. Board contenders (1+ commit a day or 50+ PRs a year) are refreshed daily, never-fetched developers next, and the long tail every 3 days.
 - **Claims.** Opening any profile, or pressing *Refresh stats*, syncs that developer at once.
 - **Catch-up / seeding.** Crawl locally at full GitHub speed, then push:
 
@@ -91,7 +91,7 @@ done
 
 `POST /api/admin/crawl?users=100` runs one crawl step on production on demand, with the same bearer token.
 
-**Free-plan budget.** D1 allows 100k rows written per day. The `users` table is `WITHOUT ROWID` with a single `loc` index, so a stats refresh costs 1 written row and a new developer costs 2. Steady crawling uses about 40k/day. Push large seeds in parts (`--max-stubs`) on different days. On Workers Paid, raise `NUXT_CRAWL_BATCH` (for example 150) and push everything at once.
+**Free-plan budget.** D1 allows 100k rows written per day. The `users` table is `WITHOUT ROWID` with a single `loc` index, so a stats refresh costs 1 written row and a new developer costs 2. Steady crawling uses about 40k/day. D1 also allows 5M rows read per day. Boards are ranked in the Worker rather than in SQL, where five `ROW_NUMBER()` windows re-read each row about 18 times: a location's board reads its rows once, the global board reads only developers above 80% of its last cutoffs, and the global and country aggregates rebuild every 6h. Per-query costs measured on a copy of production put steady crawling at about 3M rows read per day. Push large seeds in parts (`--max-stubs`) on different days. On Workers Paid, raise `NUXT_CRAWL_BATCH` (for example 150) and push everything at once.
 
 **Test the built Worker locally** (real `workerd`, local D1/KV):
 
