@@ -28,8 +28,10 @@ const AUTOMATED_SHOWN = 12
 const STAT_COLUMNS =
   'login, id, name, location, company, followers, commits, prs, reviews, issues, contributions, active_days AS activeDays'
 
+// The fallback is the location whose search found the developer; a stuffed location matches
+// every search, so it falls back to nowhere.
 const slugFor = (location: string | null, fallback: string) =>
-  matchLocation(location)?.slug ?? fallback
+  isStuffedLocation(location) ? OTHER : (matchLocation(location)?.slug ?? fallback)
 
 // ---------------------------------------------------------------------------
 // Writes: one statement per call via json_each (D1 free plan allows 50 queries per invocation)

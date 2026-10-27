@@ -133,7 +133,30 @@ export function slugifyLocation(input: string) {
     .slice(0, 40)
 }
 
+/**
+ * A location naming this many curated places is keyword stuffing ("uk usa india nepal ..."),
+ * written to show up in every country's search. People who list where they've lived name
+ * at most five.
+ */
+const STUFFED_AT = 6
+
 let matchers: { loc: LocationInfo; re: RegExp }[] | undefined
+
+function locationMatchers() {
+  return (matchers ??= LOCATIONS.map(loc => {
+    const words = [...loc.terms, ...(loc.aliases ?? [])].map(w =>
+      w.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    )
+    return { loc, re: new RegExp(`(?:^|[^\\p{L}])(?:${words.join('|')})(?:$|[^\\p{L}])`, 'iu') }
+  }))
+}
+
+/** Whether a location is keyword stuffing; such developers rank on no location's board. */
+export function isStuffedLocation(text: string | null | undefined) {
+  // Most locations are a few words long, too short to name that many places.
+  if (!text || (text.match(/\p{L}+/gu)?.length ?? 0) < STUFFED_AT) return false
+  return locationMatchers().filter(m => m.re.test(text)).length >= STUFFED_AT
+}
 
 /**
  * Map a profile's free-text location ("Kathmandu, Nepal") to a curated location.
@@ -141,16 +164,10 @@ let matchers: { loc: LocationInfo; re: RegExp }[] | undefined
  * ("New South Wales, Australia" is Australia, not Wales).
  */
 export function matchLocation(text: string | null | undefined): LocationInfo | null {
-  if (!text) return null
-  matchers ??= LOCATIONS.map(loc => {
-    const words = [...loc.terms, ...(loc.aliases ?? [])].map(w =>
-      w.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-    )
-    return { loc, re: new RegExp(`(?:^|[^\\p{L}])(?:${words.join('|')})(?:$|[^\\p{L}])`, 'iu') }
-  })
+  if (!text || isStuffedLocation(text)) return null
   const segments = text.split(/[,|/·;]/).reverse()
   for (const segment of segments) {
-    const hit = matchers.find(m => m.re.test(segment))
+    const hit = locationMatchers().find(m => m.re.test(segment))
     if (hit) return hit.loc
   }
   return null

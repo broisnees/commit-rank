@@ -25,7 +25,8 @@ GitHub can't sort users by commits, so commitrank keeps its own index in **D1**:
 2. **Stats.** Each user's last-12-month commits, PRs, reviews, issues and contributions are fetched with batched GraphQL. They're refreshed about daily.
 3. **Boards.** After a crawl slice, the location's leaderboard is rebuilt with one SQL window query (at most every 30 minutes per location) and stored as a single row. A page view is one D1 row read, or zero reads when it's cached in memory.
 4. **Automation filter.** Auto-commit scripts can log 1,000+ commits a day. Accounts averaging 100+ commits (or 150+ contributions) per active day are flagged and kept off the rankings. Each board lists them under "Excluded as likely automation".
-5. **Claim by visiting.** Opening any profile registers that developer with fresh stats. If they make their country's top 100, the board is rebuilt on the spot. Their rank is exact among everyone tracked in the country, plus a worldwide rank when they're in the global top 100.
+5. **Location stuffing.** A location naming 6 or more countries ("uk usa india nepal ...") is written to match every country's search, so those developers rank on no country's board. People listing where they've lived name at most 5.
+6. **Claim by visiting.** Opening any profile registers that developer with fresh stats. If they make their country's top 100, the board is rebuilt on the spot. Their rank is exact among everyone tracked in the country, plus a worldwide rank when they're in the global top 100.
 
 A profile's **Refresh** button re-fetches it from GitHub (10-minute cooldown) and re-ranks it.
 
